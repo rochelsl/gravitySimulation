@@ -7,8 +7,11 @@
 const int width = 1920;
 const int height = 1080;
 
-const float gConst = 10;
-const float particleMass = 1000;
+const float gConst = 100.0;
+const float particleMass = 1.0;
+
+//For Barnes-Hut algorithm, to stop subdivision at some spatial resolutions to prevent exploding tree depth
+const float MIN_SIZE = 1.0f;
 
 struct Particle {
     sf::Vector2f position;
@@ -61,8 +64,22 @@ void subdivide(Node* node) {
     }
 }
 
+bool contains(const Quad& q, const sf::Vector2f& pos) {
+    return (pos.x >= q.x - q.halfSize &&
+            pos.x <= q.x + q.halfSize &&
+            pos.y >= q.y - q.halfSize &&
+            pos.y <= q.y + q.halfSize);
+}
+
 //Inserting particles into the quadrant
 void insert(Node* node, Particle* p) {
+    if (!contains(node->boundary, p->position)) return;
+
+    // existing code continues
+    if (node->particle == nullptr && node->isLeaf()) {
+        node->particle = p;
+        return;
+    }
     // empty leaf
     if (node->particle == nullptr && node->isLeaf()) {
         node->particle = p;
@@ -71,14 +88,24 @@ void insert(Node* node, Particle* p) {
 
     // subdivide if needed
     if (node->isLeaf()) {
+        // stop subdivision if too small
+        if (node->boundary.halfSize < MIN_SIZE) {
+            // fallback: accumulate mass instead of subdividing
+            if (node->particle == nullptr) {
+                node->particle = p;
+            }
+            return;
+        }
+
         subdivide(node);
 
-        // reinsert existing particle
         Particle* old = node->particle;
         node->particle = nullptr;
 
-        int qOld = getQuadrant(node->boundary, old->position);
-        insert(node->children[qOld], old);
+        if (old) {
+            int qOld = getQuadrant(node->boundary, old->position);
+            insert(node->children[qOld], old);
+        }
     }
 
     int q = getQuadrant(node->boundary, p->position);
@@ -157,7 +184,12 @@ void computeGravityBH(std::vector<Particle>& particles) {
 
     // build root node (cover entire domain)
     Node* root = new Node();
-    root->boundary = {width / 2.f, height / 2.f, static_cast<float>(std::max(width, height))};
+    root->boundary = {
+    width / 2.f,
+    height / 2.f,
+    static_cast<float>(std::max(width, height))* 0.5f
+};
+    //root->boundary = {width / 2.f, height / 2.f, static_cast<float>(std::max(width, height))};
 
     // insert particles
     for (auto& p : particles)
