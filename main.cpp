@@ -1,8 +1,11 @@
+//When eomploying OpenGL run using: g++ -std=c++17 main.cpp -o main -lGLEW -lGL -lGLU -lsfml-graphics -lsfml-window -lsfml-system
+#include <GL/glew.h>
 #include <SFML/Graphics.hpp>
 #include <vector>
 #include <random>
 #include <cmath>
 #include <iostream>
+#include <string>
 
 const int width = 1500;
 const int height = 1500;
@@ -20,6 +23,15 @@ struct Particle {
 
     float mass;
     float radius;
+};
+
+//Replacing Particle as the active simulation state
+struct GPUPosition {
+    float x, y, z, mass;
+};
+
+struct GPUVelocity {
+    float vx, vy, vz, radius;
 };
 
 //For implementation of a Barnes-Hut algorithm
@@ -276,9 +288,108 @@ float computePotential(const std::vector<Particle>& particles) {
     return U;
 }
 
+//GPU shader helper functions
+GLuint compileShader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint success = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+
+    if (!success) {
+        char log[1024];
+        glGetShaderInfoLog(shader, 1024, nullptr, log);
+        std::cerr << "Shader compile error:\n" << log << std::endl;
+    }
+
+    return shader;
+}
+
+GLuint createProgram(const char* vertexSrc, const char* fragmentSrc) {
+    GLuint vs = compileShader(GL_VERTEX_SHADER, vertexSrc);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragmentSrc);
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+
+    GLint success = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+
+    if (!success) {
+        char log[1024];
+        glGetProgramInfoLog(program, 1024, nullptr, log);
+        std::cerr << "Program link error:\n" << log << std::endl;
+    }
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    return program;
+}
+
 int main() {
-    auto window = sf::RenderWindow{{width, height}, "Particle Simulation"}; 
-    window.setFramerateLimit(144); 
+    sf::ContextSettings settings;
+    settings.majorVersion = 4;
+    settings.minorVersion = 3;
+    settings.depthBits = 24;
+    settings.stencilBits = 8;
+
+    auto window = sf::RenderWindow(
+        sf::VideoMode(width, height),
+        "Particle Simulation",
+        sf::Style::Default,
+        settings
+    );
+
+    window.setActive(true);
+    //Initialize GLEW after window creation
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) {
+        std::cerr << "Failed to initialize GLEW\n";
+        return -1;
+    }
+
+    //Adding the OpenGL shaders after GLEW initialization
+    const char* vertexShaderSrc = R"(
+    #version 430 core
+
+    layout(std430, binding = 0) buffer Positions {
+        vec4 posMass[];
+    };
+
+    uniform float uWidth;
+    uniform float uHeight;
+    uniform float uPointSize;
+
+    void main() {
+        vec2 pos = posMass[gl_VertexID].xy;
+
+        float x = (pos.x / uWidth) * 2.0 - 1.0;
+        float y = 1.0 - (pos.y / uHeight) * 2.0;
+
+        gl_Position = vec4(x, y, 0.0, 1.0);
+        gl_PointSize = uPointSize;
+    }
+    )";
+
+    const char* fragmentShaderSrc = R"(
+    #version 430 core
+
+    out vec4 FragColor;
+
+    void main() {
+        FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+    }
+    )";
+    GLuint renderProgram = createProgram(vertexShaderSrc, fragmentShaderSrc);
+
+    //After creating renderProgram
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
 
     std::vector<Particle> particles;
 
@@ -358,6 +469,51 @@ int main() {
     for (auto& p : particles)
         p.velocity -= vcm;
 
+    //after initialization, virial scaling, rotation and drift removal add the GPU arrays
+    std::vector<GPUPosition> gpuPositions(particles.size());
+    std::vector<GPUVelocity> gpuVelocities(particles.size());
+    GLuint posSSBO;
+    GLuint velSSBO;
+
+    glGenBuffers(1, &posSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, posSSBO);
+    glBufferData(
+        GL_SHADER_STORAGE_BUFFER,
+        gpuPositions.size() * sizeof(GPUPosition),
+        gpuPositions.data(),
+        GL_DYNAMIC_DRAW
+    );
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+
+    glGenBuffers(1, &velSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
+    glBufferData(
+        GL_SHADER_STORAGE_BUFFER,
+        gpuVelocities.size() * sizeof(GPUVelocity),
+        gpuVelocities.data(),
+        GL_DYNAMIC_DRAW
+    );
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    for (size_t i = 0; i < particles.size(); ++i) {
+        gpuPositions[i] = {
+            particles[i].position.x,
+            particles[i].position.y,
+            0.0f,
+            particles[i].mass
+        };
+        gpuVelocities[i] = {
+            particles[i].velocity.x,
+            particles[i].velocity.y,
+            0.0f,
+            particles[i].radius
+        };
+    }
+    for (auto& p : particles)
+    p.velocity -= vcm;
+
     // Initial acceleration for velocity Verlet.
     computeGravityBH(particles);
 
@@ -365,10 +521,10 @@ int main() {
     // sf::CircleShape shape;
     // shape.setFillColor(sf::Color::White);
 
-    sf::VertexBuffer points(sf::Points);
-    points.create(particles.size());
-    points.setUsage(sf::VertexBuffer::Stream);
-    std::vector<sf::Vertex> vertices(particles.size());
+    //sf::VertexBuffer points(sf::Points);
+    //points.create(particles.size());
+    //points.setUsage(sf::VertexBuffer::Stream);
+    //std::vector<sf::Vertex> vertices(particles.size());
 
     const float dt = 0.0005f;
 
@@ -395,22 +551,33 @@ int main() {
             p.velocity *= 0.9999f;
         }
 
+        for (size_t i = 0; i < particles.size(); ++i) {
+            gpuPositions[i].x = particles[i].position.x;
+            gpuPositions[i].y = particles[i].position.y;
+            gpuPositions[i].z = 0.0f;
+            gpuPositions[i].mass = particles[i].mass;
+        }
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, posSSBO);
+        glBufferSubData(
+            GL_SHADER_STORAGE_BUFFER,
+            0,
+            gpuPositions.size() * sizeof(GPUPosition),
+            gpuPositions.data()
+        );
+
         window.clear();
 
-        //Uncomment to render particles as spheres
-        // for (const auto& p : particles) {
-        //     shape.setRadius(p.radius);
-        //     shape.setOrigin({p.radius, p.radius});
-        //     shape.setPosition(p.position);
-        //     window.draw(shape);
-        // }
-
-        for (size_t i = 0; i < particles.size(); ++i) {
-            vertices[i].position = particles[i].position;
-            vertices[i].color = sf::Color::White;
-        }
-        points.update(vertices.data());
-        window.draw(points);
+        glViewport(0, 0, width, height);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(renderProgram);
+        glUniform1f(glGetUniformLocation(renderProgram, "uWidth"), static_cast<float>(width));
+        glUniform1f(glGetUniformLocation(renderProgram, "uHeight"), static_cast<float>(height));
+        glUniform1f(glGetUniformLocation(renderProgram, "uPointSize"), 1.5f);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_POINTS, 0, particles.size());
 
         window.display();
 
