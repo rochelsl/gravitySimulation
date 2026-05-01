@@ -4,8 +4,8 @@
 #include <cmath>
 #include <iostream>
 
-const int width = 1920;
-const int height = 1080;
+const int width = 1500;
+const int height = 1500;
 
 const float gConst = 1000.0;
 const float particleMass = 100.0;
@@ -245,12 +245,12 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 1000;
+    const int N = 5000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
     std::uniform_real_distribution<float> jitter(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> vel(-10.f, 10.f);
+    std::uniform_real_distribution<float> vel(-20.f, 20.f);
     // Grid initialization avoids catastrophic LJ overlaps from random placement.
     int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
     int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
@@ -271,12 +271,12 @@ int main() {
     }
 
     //Remove net momentum which might occur from random initial velocity initialization
-    // sf::Vector2f vcm = {0.f, 0.f};
-    // for (const auto& p : particles)
-    //     vcm += p.velocity;
-    // vcm /= particles.size();
-    // for (auto& p : particles)
-    //     p.velocity -= vcm;
+    sf::Vector2f vcm = {0.f, 0.f};
+    for (const auto& p : particles)
+        vcm += p.velocity;
+    vcm /= static_cast<float>(particles.size());
+    for (auto& p : particles)
+        p.velocity -= vcm;
 
     // Initial acceleration for velocity Verlet.
     computeGravityBH(particles);
