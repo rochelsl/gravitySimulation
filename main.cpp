@@ -155,7 +155,7 @@ void computeForce(Node* node, Particle& p, float theta) {
 
     // ONLY here decide: approximate OR recurse
     if (node->isLeaf()) {
-        if (node->particle == &p) return;
+        if (node->particle == nullptr || node->particle == &p) return;
 
         const float rCut = 10.0f;
         if (dist < rCut) {
@@ -282,7 +282,7 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 5000;
+    const int N = 10000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
@@ -361,8 +361,11 @@ int main() {
     // Initial acceleration for velocity Verlet.
     computeGravityBH(particles);
 
-    sf::CircleShape shape;
-    shape.setFillColor(sf::Color::White);
+    //Uncomment to render particles as spheres (more performance heavy)
+    // sf::CircleShape shape;
+    // shape.setFillColor(sf::Color::White);
+
+    sf::VertexArray points(sf::Points, particles.size());
 
     const float dt = 0.0005f;
 
@@ -391,12 +394,20 @@ int main() {
 
         window.clear();
 
-        for (const auto& p : particles) {
-            shape.setRadius(p.radius);
-            shape.setOrigin({p.radius, p.radius});
-            shape.setPosition(p.position);
-            window.draw(shape);
+        //Uncomment to render particles as spheres
+        // for (const auto& p : particles) {
+        //     shape.setRadius(p.radius);
+        //     shape.setOrigin({p.radius, p.radius});
+        //     shape.setPosition(p.position);
+        //     window.draw(shape);
+        // }
+
+        for (size_t i = 0; i < particles.size(); ++i) {
+            points[i].position = particles[i].position;
+            points[i].color = sf::Color::White;
         }
+
+        window.draw(points);
         window.display();
 
         // float ts = particles[0].position.x;
