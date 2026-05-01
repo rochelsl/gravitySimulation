@@ -11,7 +11,7 @@ const int width = 1500;
 const int height = 1500;
 
 const float gConst = 1000.0;
-const float particleMass = 100.0;
+const float particleMass = 1000.0;
 
 //For Barnes-Hut algorithm, to stop subdivision at some spatial resolutions to prevent exploding tree depth
 const float MIN_SIZE = 1.0f;
@@ -530,7 +530,7 @@ int main() {
     width * 0.5f,
     height * 0.5f
     };
-    const float rotationStrength = 200.0f; // tune this
+    const float rotationStrength = 1000.0f; // tune this
     for (auto& p : particles) {
         sf::Vector2f r = p.position - center;
         // periodic minimum-image displacement from center
@@ -581,6 +581,15 @@ int main() {
     );
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
 
+    for (size_t i = 0; i < particles.size(); ++i) {
+        gpuVelocities[i] = {
+            particles[i].velocity.x,
+            particles[i].velocity.y,
+            0.0f,
+            particles[i].radius
+        };
+    }
+
     glGenBuffers(1, &velSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
     glBufferData(
@@ -592,15 +601,6 @@ int main() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
-    for (size_t i = 0; i < particles.size(); ++i) {
-        gpuVelocities[i] = {
-            particles[i].velocity.x,
-            particles[i].velocity.y,
-            0.0f,
-            particles[i].radius
-        };
-    }
 
     //After creating gpuPositions and gpuVelocities
     std::vector<GPUAcceleration> gpuAccelerations(particles.size());
@@ -626,18 +626,6 @@ int main() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-    // Initial acceleration for velocity Verlet.
-    computeGravityBH(particles);
-
-    //Uncomment to render particles as spheres (more performance heavy)
-    // sf::CircleShape shape;
-    // shape.setFillColor(sf::Color::White);
-
-    //sf::VertexBuffer points(sf::Points);
-    //points.create(particles.size());
-    //points.setUsage(sf::VertexBuffer::Stream);
-    //std::vector<sf::Vertex> vertices(particles.size());
-
     const float dt = 0.0005f;
 
     while (window.isOpen()) { 
@@ -652,20 +640,6 @@ int main() {
 			}
         }
 
-        // upload current CPU accelerations to GPU
-        for (size_t i = 0; i < particles.size(); ++i) {
-            gpuAccelerations[i].ax = particles[i].acceleration.x;
-            gpuAccelerations[i].ay = particles[i].acceleration.y;
-            gpuAccelerations[i].az = 0.0f;
-            gpuAccelerations[i].unused = 0.0f;
-        }
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, accSSBO);
-        glBufferSubData(
-            GL_SHADER_STORAGE_BUFFER,
-            0,
-            gpuAccelerations.size() * sizeof(GPUAcceleration),
-            gpuAccelerations.data()
-        );
         window.clear();
 
         //At the start of each frame, before integration:
