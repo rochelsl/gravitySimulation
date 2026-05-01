@@ -158,20 +158,31 @@ void computeForce(Node* node, Particle& p, float theta) {
 
     float s = node->boundary.halfSize * 2.f;
 
-    // ✅ ONLY here decide: approximate OR recurse
-    if (node->isLeaf() || (s / dist) < theta) {
+    // ONLY here decide: approximate OR recurse
+    if (node->isLeaf()) {
         if (node->particle == &p) return;
+
+        const float rCut = 10.0f;
+        if (dist < rCut) {
+            float rep = 0.05f * (rCut - dist);
+            p.acceleration -= (r / dist) * rep;
+        }
 
         float invDist = 1.0f / dist;
         float invDist3 = invDist * invDist * invDist;
-
         float f = gConst * node->mass * invDist3;
         p.acceleration += r * f;
-    } else {
-        for (int i = 0; i < 4; ++i) {
+    }
+    else if ((s / dist) < theta) {
+        float invDist = 1.0f / dist;
+        float invDist3 = invDist * invDist * invDist;
+        float f = gConst * node->mass * invDist3;
+        p.acceleration += r * f;
+    }
+    else {
+        for (int i = 0; i < 4; ++i)
             if (node->children[i])
                 computeForce(node->children[i], p, theta);
-        }
     }
 
     // optional repulsion (keep small)
@@ -236,7 +247,38 @@ void integrate(std::vector<Particle>& particles, float dt) {
 
     if (p.position.y < 0) p.position.y += height;
     if (p.position.y >= height) p.position.y -= height;
+    }
 }
+
+//for virialized initial conditions, where 2T = |U| (T: total kinetic energy, U: total potential energy)
+float computeKinetic(const std::vector<Particle>& particles) {
+    float T = 0.f;
+    for (const auto& p : particles) {
+        float v2 = p.velocity.x * p.velocity.x + p.velocity.y * p.velocity.y;
+        T += 0.5f * p.mass * v2;
+    }
+    return T;
+}
+
+float computePotential(const std::vector<Particle>& particles) {
+    float U = 0.f;
+
+    for (size_t i = 0; i < particles.size(); ++i) {
+        for (size_t j = i + 1; j < particles.size(); ++j) {
+            sf::Vector2f r = particles[j].position - particles[i].position;
+
+            // periodic wrapping
+            if (r.x >  width * 0.5f) r.x -= width;
+            if (r.x < -width * 0.5f) r.x += width;
+            if (r.y >  height * 0.5f) r.y -= height;
+            if (r.y < -height * 0.5f) r.y += height;
+
+            float dist = std::sqrt(r.x*r.x + r.y*r.y + 25.0f); // eps^2 = 5^2
+            U -= gConst * particles[i].mass * particles[j].mass / dist;
+        }
+    }
+
+    return U;
 }
 
 int main() {
@@ -245,12 +287,12 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 5000;
+    const int N = 10000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> jitter(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> vel(-20.f, 20.f);
+    std::uniform_real_distribution<float> jitter(-0.4f, 0.4f);
+    std::uniform_real_distribution<float> vel(-10.f, 10.f);
     // Grid initialization avoids catastrophic LJ overlaps from random placement.
     int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
     int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
@@ -270,7 +312,20 @@ int main() {
         particles.push_back(p);
     }
 
-    //Remove net momentum which might occur from random initial velocity initialization
+    //virialized initial conditions to rescale velocities to virial equilibrium
+    float T = computeKinetic(particles);
+    float U = computePotential(particles);
+
+    // target: 2T = |U|
+    //if the system is too "hot", reduce the scaling factor
+    float scale = 0.05f * std::sqrt(std::abs(U) / (2.0f * T));
+
+    // rescale velocities
+    for (auto& p : particles) {
+        p.velocity *= scale;
+    }
+
+    //Remove net momentum/drift which might occur from random initial velocity initialization
     sf::Vector2f vcm = {0.f, 0.f};
     for (const auto& p : particles)
         vcm += p.velocity;
