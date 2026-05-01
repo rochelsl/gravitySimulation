@@ -16,6 +16,11 @@ const float particleMass = 1000.0;
 //For Barnes-Hut algorithm, to stop subdivision at some spatial resolutions to prevent exploding tree depth
 const float MIN_SIZE = 1.0f;
 
+//Adding grid buffers for GPU computation
+const int gridW = 128;
+const int gridH = 72;
+const int gridSize = gridW * gridH;
+
 struct Particle {
     sf::Vector2f position;
     sf::Vector2f velocity;
@@ -479,6 +484,47 @@ int main() {
     )";
     GLuint gravityProgram = createComputeProgram(gravityShaderSrc);
 
+    const char* clearGridShaderSrc = R"(
+    #version 430 core
+    layout(local_size_x = 256) in;
+    layout(std430, binding = 3) buffer DensityGrid {
+        uint density[];
+    };
+    uniform uint gridSize;
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= gridSize) return;
+        density[i] = 0u;
+    }
+    )";
+    GLuint clearGridProgram = createComputeProgram(clearGridShaderSrc);
+
+    const char* depositShaderSrc = R"(
+    #version 430 core
+    layout(local_size_x = 256) in;
+    layout(std430, binding = 0) buffer Positions {
+        vec4 posMass[];
+    };
+    layout(std430, binding = 3) buffer DensityGrid {
+        uint density[];
+    };
+    uniform float width;
+    uniform float height;
+    uniform uint gridW;
+    uniform uint gridH;
+    uniform uint numParticles;
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= numParticles) return;
+        vec2 pos = posMass[i].xy;
+        uint cellX = uint(clamp(pos.x / width  * float(gridW), 0.0, float(gridW - 1)));
+        uint cellY = uint(clamp(pos.y / height * float(gridH), 0.0, float(gridH - 1)));
+        uint cellIndex = cellY * gridW + cellX;
+        atomicAdd(density[cellIndex], 1u);
+    }
+    )";
+    GLuint depositProgram = createComputeProgram(depositShaderSrc);
+
     std::vector<Particle> particles;
 
     const int N = 10000;
@@ -626,6 +672,19 @@ int main() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
+    std::vector<unsigned int> densityGrid(gridSize, 0);
+    GLuint densitySSBO;
+    glGenBuffers(1, &densitySSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, densitySSBO);
+    glBufferData(
+        GL_SHADER_STORAGE_BUFFER,
+        densityGrid.size() * sizeof(unsigned int),
+        densityGrid.data(),
+        GL_DYNAMIC_DRAW
+    );
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, densitySSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
     const float dt = 0.0005f;
 
     while (window.isOpen()) { 
@@ -640,10 +699,33 @@ int main() {
 			}
         }
 
-        window.clear();
+        GLuint particleGroups = static_cast<GLuint>((particles.size() + 255) / 256);
+        GLuint gridGroups = static_cast<GLuint>((gridSize + 255) / 256);
+
+        // 1. Clear density grid
+        glUseProgram(clearGridProgram);
+        glUniform1ui(
+            glGetUniformLocation(clearGridProgram, "gridSize"),
+            static_cast<unsigned int>(gridSize)
+        );
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, densitySSBO);
+        glDispatchCompute(gridGroups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        // 2. Deposit particles into density grid
+        glUseProgram(depositProgram);
+        glUniform1f(glGetUniformLocation(depositProgram, "width"), static_cast<float>(width));
+        glUniform1f(glGetUniformLocation(depositProgram, "height"), static_cast<float>(height));
+        glUniform1ui(glGetUniformLocation(depositProgram, "gridW"), static_cast<unsigned int>(gridW));
+        glUniform1ui(glGetUniformLocation(depositProgram, "gridH"), static_cast<unsigned int>(gridH));
+        glUniform1ui(glGetUniformLocation(depositProgram, "numParticles"), static_cast<unsigned int>(particles.size()));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, densitySSBO);
+        glDispatchCompute(particleGroups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         //At the start of each frame, before integration:
-        glUseProgram(gravityProgram);
+        //glUseProgram(gravityProgram);
         glUniform1f(glGetUniformLocation(gravityProgram, "width"), static_cast<float>(width));
         glUniform1f(glGetUniformLocation(gravityProgram, "height"), static_cast<float>(height));
         glUniform1f(glGetUniformLocation(gravityProgram, "gConst"), gConst);
@@ -679,10 +761,23 @@ int main() {
         glBindVertexArray(vao);
         glDrawArrays(GL_POINTS, 0, particles.size());
 
-        window.display();
+        static int frame = 0;
+        frame++;
+        if (frame % 300 == 0) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, densitySSBO);
+            glGetBufferSubData(
+                GL_SHADER_STORAGE_BUFFER,
+                0,
+                densityGrid.size() * sizeof(unsigned int),
+                densityGrid.data()
+            );
+            unsigned int total = 0;
+            for (auto v : densityGrid)
+                total += v;
+            std::cout << "Deposited particles: " << total << std::endl;
+        }
 
-        // float ts = particles[0].position.x;
-        // std::cout << ts << std::endl;
+        window.display();
     }
     return 0;
 }
