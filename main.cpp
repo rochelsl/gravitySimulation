@@ -287,15 +287,15 @@ int main() {
 
     std::mt19937 rng(std::random_device{}());
 
-    std::uniform_real_distribution<float> vel(-40.f, 40.f);
+    std::uniform_real_distribution<float> vel(-60.f, 60.f);
     // Grid initialization avoids catastrophic LJ overlaps from random placement.
     int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
     int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
     float dx = static_cast<float>(width) / cols;
     float dy = static_cast<float>(height) / rows;
     //deviations from perfect square lattice
-    std::uniform_real_distribution<float> jitterX(-0.4f * dx, 0.4f * dx);
-    std::uniform_real_distribution<float> jitterY(-0.4f * dy, 0.4f * dy);
+    std::uniform_real_distribution<float> jitterX(-0.8f * dx, 0.8f * dx);
+    std::uniform_real_distribution<float> jitterY(-0.8f * dy, 0.8f * dy);
 
     for (int i = 0; i < N; ++i) {
         int ix = i % cols;
@@ -365,7 +365,10 @@ int main() {
     // sf::CircleShape shape;
     // shape.setFillColor(sf::Color::White);
 
-    sf::VertexArray points(sf::Points, particles.size());
+    sf::VertexBuffer points(sf::Points);
+    points.create(particles.size());
+    points.setUsage(sf::VertexBuffer::Stream);
+    std::vector<sf::Vertex> vertices(particles.size());
 
     const float dt = 0.0005f;
 
@@ -403,11 +406,12 @@ int main() {
         // }
 
         for (size_t i = 0; i < particles.size(); ++i) {
-            points[i].position = particles[i].position;
-            points[i].color = sf::Color::White;
+            vertices[i].position = particles[i].position;
+            vertices[i].color = sf::Color::White;
         }
-
+        points.update(vertices.data());
         window.draw(points);
+
         window.display();
 
         // float ts = particles[0].position.x;
