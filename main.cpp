@@ -439,6 +439,46 @@ int main() {
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
 
+    //After integration shader
+    const char* gravityShaderSrc = R"(
+    #version 430 core
+    layout(local_size_x = 256) in;
+    layout(std430, binding = 0) buffer Positions {
+        vec4 posMass[];
+    };
+    layout(std430, binding = 2) buffer Accelerations {
+        vec4 acc[];
+    };
+    uniform float width;
+    uniform float height;
+    uniform float gConst;
+    uniform float eps;
+    uniform uint numParticles;
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= numParticles) return;
+        vec2 posI = posMass[i].xy;
+        float massI = posMass[i].w;
+        vec2 a = vec2(0.0);
+        for (uint j = 0; j < numParticles; ++j) {
+            if (i == j) continue;
+            vec2 r = posMass[j].xy - posI;
+            // periodic minimum-image convention
+            if (r.x >  width * 0.5) r.x -= width;
+            if (r.x < -width * 0.5) r.x += width;
+            if (r.y >  height * 0.5) r.y -= height;
+            if (r.y < -height * 0.5) r.y += height;
+            float dist2 = dot(r, r) + eps * eps;
+            float invDist = inversesqrt(dist2);
+            float invDist3 = invDist * invDist * invDist;
+            // acceleration, not force
+            a += gConst * posMass[j].w * r * invDist3;
+        }
+        acc[i] = vec4(a, 0.0, 0.0);
+    }
+    )";
+    GLuint gravityProgram = createComputeProgram(gravityShaderSrc);
+
     std::vector<Particle> particles;
 
     const int N = 10000;
@@ -626,7 +666,23 @@ int main() {
             gpuAccelerations.size() * sizeof(GPUAcceleration),
             gpuAccelerations.data()
         );
-        // GPU integration
+        window.clear();
+
+        //At the start of each frame, before integration:
+        glUseProgram(gravityProgram);
+        glUniform1f(glGetUniformLocation(gravityProgram, "width"), static_cast<float>(width));
+        glUniform1f(glGetUniformLocation(gravityProgram, "height"), static_cast<float>(height));
+        glUniform1f(glGetUniformLocation(gravityProgram, "gConst"), gConst);
+        glUniform1f(glGetUniformLocation(gravityProgram, "eps"), 8.0f);
+        glUniform1ui(glGetUniformLocation(gravityProgram, "numParticles"), static_cast<unsigned int>(particles.size()));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
+
+        GLuint groups = static_cast<GLuint>((particles.size() + 255) / 256);
+        glDispatchCompute(groups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        // 2. GPU integration
         glUseProgram(integrateProgram);
         glUniform1f(glGetUniformLocation(integrateProgram, "dt"), dt);
         glUniform1f(glGetUniformLocation(integrateProgram, "width"), static_cast<float>(width));
@@ -635,71 +691,8 @@ int main() {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
-        GLuint groups = static_cast<GLuint>((particles.size() + 255) / 256);
         glDispatchCompute(groups, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
-
-        //After the compute shader dispatch
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, posSSBO);
-        glGetBufferSubData(
-            GL_SHADER_STORAGE_BUFFER,
-            0,
-            gpuPositions.size() * sizeof(GPUPosition),
-            gpuPositions.data()
-        );
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
-        glGetBufferSubData(
-            GL_SHADER_STORAGE_BUFFER,
-            0,
-            gpuVelocities.size() * sizeof(GPUVelocity),
-            gpuVelocities.data()
-        );
-        for (size_t i = 0; i < particles.size(); ++i) {
-            particles[i].position = {gpuPositions[i].x, gpuPositions[i].y};
-            particles[i].velocity = {gpuVelocities[i].vx, gpuVelocities[i].vy};
-        }
-
-        // 2. recompute forces
-        computeGravityBH(particles);
-        // 3. finish velocity update
-        for (auto& p : particles) {
-            //p.velocity += 0.5f * p.acceleration * dt;
-            //optional cooling/dissipative term so that stable clusters are formed
-            p.velocity *= 0.9999f;
-        }
-
-        //After cooling, also update gpuVelocities and upload:
-        for (size_t i = 0; i < particles.size(); ++i) {
-            gpuVelocities[i].vx = particles[i].velocity.x;
-            gpuVelocities[i].vy = particles[i].velocity.y;
-            gpuVelocities[i].vz = 0.0f;
-            gpuVelocities[i].radius = particles[i].radius;
-        }
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
-        glBufferSubData(
-            GL_SHADER_STORAGE_BUFFER,
-            0,
-            gpuVelocities.size() * sizeof(GPUVelocity),
-            gpuVelocities.data()
-        );
-
-
-        for (size_t i = 0; i < particles.size(); ++i) {
-            gpuPositions[i].x = particles[i].position.x;
-            gpuPositions[i].y = particles[i].position.y;
-            gpuPositions[i].z = 0.0f;
-            gpuPositions[i].mass = particles[i].mass;
-        }
-
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, posSSBO);
-        glBufferSubData(
-            GL_SHADER_STORAGE_BUFFER,
-            0,
-            gpuPositions.size() * sizeof(GPUPosition),
-            gpuPositions.data()
-        );
-
-        window.clear();
 
         glViewport(0, 0, width, height);
         glClearColor(0.f, 0.f, 0.f, 1.f);
@@ -717,7 +710,5 @@ int main() {
         // float ts = particles[0].position.x;
         // std::cout << ts << std::endl;
     }
-
-
     return 0;
 }
