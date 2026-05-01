@@ -73,7 +73,8 @@ bool contains(const Quad& q, const sf::Vector2f& pos) {
 
 //Inserting particles into the quadrant
 void insert(Node* node, Particle* p) {
-    if (!contains(node->boundary, p->position)) return;
+    //Deactivated for periodic boundary
+    //if (!contains(node->boundary, p->position)) return;
 
     // existing code continues
     if (node->particle == nullptr && node->isLeaf()) {
@@ -144,6 +145,15 @@ void computeForce(Node* node, Particle& p, float theta) {
     if (node->mass == 0.f) return;
 
     sf::Vector2f r = node->com - p.position;
+
+    //Periodic boundary
+    // wrap to nearest image
+    if (r.x >  width * 0.5f) r.x -= width;
+    if (r.x < -width * 0.5f) r.x += width;
+
+    if (r.y >  height * 0.5f) r.y -= height;
+    if (r.y < -height * 0.5f) r.y += height;
+
     float dist2 = r.x * r.x + r.y * r.y + 1e-6f;
     float dist = std::sqrt(dist2);
 
@@ -213,6 +223,15 @@ void integrate(std::vector<Particle>& particles, float dt) {
         p.position += p.velocity * dt + 0.5f * p.acceleration * dt * dt;
         p.velocity += 0.5f * p.acceleration * dt;
     }
+
+    //perdiodic boundary
+    for (auto& p : particles) {
+    if (p.position.x < 0) p.position.x += width;
+    if (p.position.x >= width) p.position.x -= width;
+
+    if (p.position.y < 0) p.position.y += height;
+    if (p.position.y >= height) p.position.y -= height;
+}
 }
 
 int main() {
