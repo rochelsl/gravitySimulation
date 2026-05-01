@@ -270,13 +270,21 @@ int main() {
         particles.push_back(p);
     }
 
+    //Remove net momentum which might occur from random initial velocity initialization
+    // sf::Vector2f vcm = {0.f, 0.f};
+    // for (const auto& p : particles)
+    //     vcm += p.velocity;
+    // vcm /= particles.size();
+    // for (auto& p : particles)
+    //     p.velocity -= vcm;
+
     // Initial acceleration for velocity Verlet.
     computeGravityBH(particles);
 
     sf::CircleShape shape;
     shape.setFillColor(sf::Color::White);
 
-    const float dt = 0.001f;
+    const float dt = 0.0005f;
 
     while (window.isOpen()) { 
         for (auto event = sf::Event{}; window.pollEvent(event);) { 
@@ -295,8 +303,11 @@ int main() {
         // 2. recompute forces
         computeGravityBH(particles);
         // 3. finish velocity update
-        for (auto& p : particles)
+        for (auto& p : particles) {
             p.velocity += 0.5f * p.acceleration * dt;
+            //optional cooling/dissipative term so that stable clusters are formed
+            p.velocity *= 0.9999f;
+        }
 
         window.clear();
 
