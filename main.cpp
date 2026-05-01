@@ -10,8 +10,10 @@
 const int width = 1500;
 const int height = 1500;
 
-const float gConst = 1000.0;
-const float particleMass = 10.0;
+const float gConst = 10.0;
+const float particleMass = 5.0;
+
+const std::string init_type = "normal";
 
 //For Barnes-Hut algorithm, to stop subdivision at some spatial resolutions to prevent exploding tree depth
 const float MIN_SIZE = 1.0f;
@@ -385,25 +387,51 @@ int main() {
 
     const char* vertexShaderSrc = R"(
     #version 430 core
+
     layout(std430, binding = 0) buffer Positions {
         vec4 posMass[];
     };
+
+    layout(std430, binding = 1) buffer Velocities {
+        vec4 velRadius[];
+    };
+
     uniform float uWidth;
     uniform float uHeight;
     uniform float uPointSize;
+
+    out float vSpeed;
+
     void main() {
         vec2 pos = posMass[gl_VertexID].xy;
+        vec2 vel = velRadius[gl_VertexID].xy;
+
+        vSpeed = length(vel);
+
         float x = (pos.x / uWidth) * 2.0 - 1.0;
         float y = 1.0 - (pos.y / uHeight) * 2.0;
+
         gl_Position = vec4(x, y, 0.0, 1.0);
         gl_PointSize = uPointSize;
     }
     )";
     const char* fragmentShaderSrc = R"(
     #version 430 core
+
+    in float vSpeed;
     out vec4 FragColor;
+
+    uniform float maxSpeed;
+
     void main() {
-        FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        float t = clamp(vSpeed / maxSpeed, 0.0, 1.0);
+
+        vec3 slowColor = vec3(0.2, 0.4, 1.0); // blue
+        vec3 fastColor = vec3(1.0, 1.0, 1.0); // white
+
+        vec3 color = mix(slowColor, fastColor, t);
+
+        FragColor = vec4(color, 1.0);
     }
     )";
 
@@ -619,36 +647,75 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 30000;
+    const int N = 200000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
 
     std::uniform_real_distribution<float> vel(-100.f, 100.f);
-    // Grid initialization avoids catastrophic LJ overlaps from random placement.
-    int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
-    int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
-    float dx = static_cast<float>(width) / cols;
-    float dy = static_cast<float>(height) / rows;
-    //deviations from perfect square lattice
-    std::uniform_real_distribution<float> jitterX(-0.8f * dx, 0.8f * dx);
-    std::uniform_real_distribution<float> jitterY(-0.8f * dy, 0.8f * dy);
 
-    for (int i = 0; i < N; ++i) {
-        int ix = i % cols;
-        int iy = i / cols;
+    if (init_type == "grid") {
+            // Grid initialization avoids catastrophic LJ overlaps from random placement.
+            int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
+            int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
+            float dx = static_cast<float>(width) / cols;
+            float dy = static_cast<float>(height) / rows;
+            //deviations from perfect square lattice
+            std::uniform_real_distribution<float> jitterX(-0.8f * dx, 0.8f * dx);
+            std::uniform_real_distribution<float> jitterY(-0.8f * dy, 0.8f * dy);
 
-        Particle p;
-        p.radius = 1.f;
-        p.position = {
-            (ix + 0.5f) * dx + jitterX(rng),
-            (iy + 0.5f) * dy + jitterY(rng)
-        };
-        p.velocity = {vel(rng), vel(rng)};
-        p.acceleration = {0.f, 0.f};
-        p.mass = particleMass;
-        particles.push_back(p);
+            for (int i = 0; i < N; ++i) {
+                int ix = i % cols;
+                int iy = i / cols;
+
+                Particle p;
+                p.radius = 1.f;
+                p.position = {
+                    (ix + 0.5f) * dx + jitterX(rng),
+                    (iy + 0.5f) * dy + jitterY(rng)
+                };
+                p.velocity = {vel(rng), vel(rng)};
+                p.acceleration = {0.f, 0.f};
+                p.mass = particleMass;
+                particles.push_back(p);
+            }
+
+    } else if (init_type == "normal") {
+        //Tune concentration
+        float width_norm1 = width * 0.5f;
+        float width_norm2 = width * 0.25f;
+        float height_norm1 = height * 0.5f;
+        float height_norm2 = height * 0.25f;
+
+
+        std::normal_distribution<float> posX(width_norm1, width_norm2);
+        std::normal_distribution<float> posY(height_norm1, height_norm2);
+        std::uniform_real_distribution<float> vel(-5.f, 5.f);
+
+        for (int i = 0; i < N; ++i) {
+            Particle p;
+
+            p.radius = 1.f;
+
+            float x = posX(rng);
+            float y = posY(rng);
+
+            while (x < 0) x += width;
+            while (x >= width) x -= width;
+
+            while (y < 0) y += height;
+            while (y >= height) y -= height;
+
+            p.position = {x, y};
+            p.velocity = {vel(rng), vel(rng)};
+            p.acceleration = {0.f, 0.f};
+            p.mass = particleMass;
+
+            particles.push_back(p);
+        }
     }
+
+
 
     //virialized initial conditions to rescale velocities to virial equilibrium
     float T = computeKinetic(particles);
@@ -791,7 +858,7 @@ int main() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, forceGridSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-    const float dt = 0.0005f;
+    const float dt = 0.0001f;
 
     while (window.isOpen()) {
         sf::Event event;
@@ -873,13 +940,16 @@ int main() {
         glViewport(0, 0, width, height);
         glClearColor(0.f, 0.f, 0.f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
+
         glUseProgram(renderProgram);
         glUniform1f(glGetUniformLocation(renderProgram, "uWidth"), static_cast<float>(width));
         glUniform1f(glGetUniformLocation(renderProgram, "uHeight"), static_cast<float>(height));
         glUniform1f(glGetUniformLocation(renderProgram, "uPointSize"), 1.5f);
+        glUniform1f(glGetUniformLocation(renderProgram, "maxSpeed"), 500.0f);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
         glBindVertexArray(vao);
-        glDrawArrays(GL_POINTS, 0, particles.size());
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(particles.size()));
 
         // static int frame = 0;
         // frame++;
