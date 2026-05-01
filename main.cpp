@@ -7,7 +7,7 @@
 const int width = 1920;
 const int height = 1080;
 
-const float gConst = 100;
+const float gConst = 10;
 const float particleMass = 1000;
 
 struct Particle {
@@ -19,32 +19,161 @@ struct Particle {
     float radius;
 };
 
-void computeGravity(std::vector<Particle>& particles) {
-    // Reset accelerations 
-    for (auto& p : particles) {
-        p.acceleration = {0.f, 0.f};
+//For implementation of a Barnes-Hut algorithm
+struct Quad {
+    float x, y;     // center
+    float halfSize; // half-width
+};
+
+struct Node {
+    Quad boundary;
+
+    float mass = 0.f;
+    sf::Vector2f com = {0.f, 0.f}; // center of mass
+
+    Particle* particle = nullptr; // leaf node (1 particle max)
+
+    Node* children[4] = {nullptr, nullptr, nullptr, nullptr};
+
+    bool isLeaf() const {
+        return children[0] == nullptr;
+    }
+};
+
+//Quadrant indexing
+int getQuadrant(const Quad& q, const sf::Vector2f& pos) {
+    int index = 0;
+    if (pos.x > q.x) index += 1;
+    if (pos.y > q.y) index += 2;
+    return index;
+}
+
+//Subdivision of quadrants
+void subdivide(Node* node) {
+    float hs = node->boundary.halfSize * 0.5f;
+
+    for (int i = 0; i < 4; ++i) {
+        node->children[i] = new Node();
+        node->children[i]->boundary.halfSize = hs;
+
+        node->children[i]->boundary.x = node->boundary.x + hs * (i % 2 ? 1.f : -1.f);
+        node->children[i]->boundary.y = node->boundary.y + hs * (i / 2 ? 1.f : -1.f);
+    }
+}
+
+//Inserting particles into the quadrant
+void insert(Node* node, Particle* p) {
+    // empty leaf
+    if (node->particle == nullptr && node->isLeaf()) {
+        node->particle = p;
+        return;
     }
 
-    for (size_t i = 0; i < particles.size(); ++i) {
-        for (size_t j = i + 1; j < particles.size(); ++j) {
+    // subdivide if needed
+    if (node->isLeaf()) {
+        subdivide(node);
 
-            auto& pi = particles[i];
-            auto& pj = particles[j];
+        // reinsert existing particle
+        Particle* old = node->particle;
+        node->particle = nullptr;
 
-            sf::Vector2f r = pj.position - pi.position;
+        int qOld = getQuadrant(node->boundary, old->position);
+        insert(node->children[qOld], old);
+    }
 
-            float r2 = r.x * r.x + r.y * r.y + 1e-6f; // softening
-            float rLen = std::sqrt(r2);
+    int q = getQuadrant(node->boundary, p->position);
+    insert(node->children[q], p);
+}
 
-            sf::Vector2f rHat = r / rLen;
+//Computing the mass distribution from the bottom-up
+void computeMass(Node* node) {
+    if (node->isLeaf()) {
+        if (node->particle) {
+            node->mass = node->particle->mass;
+            node->com = node->particle->position;
+        }
+        return;
+    }
 
-            float f = gConst * (pi.mass * pj.mass) / r2;
-            sf::Vector2f force = rHat * f;
+    node->mass = 0.f;
+    node->com = {0.f, 0.f};
 
-            pi.acceleration += force / pi.mass;
-            pj.acceleration -= force / pj.mass;
+    for (int i = 0; i < 4; ++i) {
+        Node* child = node->children[i];
+        if (!child) continue;
+
+        computeMass(child);
+
+        node->mass += child->mass;
+        node->com += child->com * child->mass;
+    }
+
+    if (node->mass > 0.f)
+        node->com /= node->mass;
+}
+
+//Barnes-Hut force computation
+void computeForce(Node* node, Particle& p, float theta) {
+    if (node->mass == 0.f) return;
+
+    sf::Vector2f r = node->com - p.position;
+    float dist2 = r.x * r.x + r.y * r.y + 1e-6f;
+    float dist = std::sqrt(dist2);
+
+    // region size
+    float s = node->boundary.halfSize * 2.f;
+
+    // if far enough → approximate
+    if (node->isLeaf() || (s / dist) < theta) {
+        if (node->particle == &p) return; // skip self
+
+        float f = gConst * (p.mass * node->mass) / dist2;
+        sf::Vector2f force = (r / dist) * f;
+
+        p.acceleration += force / p.mass;
+    } else {
+        // recurse
+        for (int i = 0; i < 4; ++i) {
+            if (node->children[i])
+                computeForce(node->children[i], p, theta);
         }
     }
+}
+
+//For memory managment, the tree each frame has to be deleted
+void deleteTree(Node* node) {
+    if (!node) return;
+
+    for (int i = 0; i < 4; ++i)
+        deleteTree(node->children[i]);
+
+    delete node;
+}
+
+void computeGravityBH(std::vector<Particle>& particles) {
+    // reset accelerations
+    for (auto& p : particles)
+        p.acceleration = {0.f, 0.f};
+
+    // build root node (cover entire domain)
+    Node* root = new Node();
+    root->boundary = {width / 2.f, height / 2.f, static_cast<float>(std::max(width, height))};
+
+    // insert particles
+    for (auto& p : particles)
+        insert(root, &p);
+
+    // compute mass distribution
+    computeMass(root);
+
+    // compute forces
+    float theta = 0.5f;
+
+    for (auto& p : particles)
+        computeForce(root, p, theta);
+
+    //Freeing memory after each force computation step/frame
+    deleteTree(root);
 }
 
 void integrate(std::vector<Particle>& particles, float dt) {
@@ -60,7 +189,7 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 100;
+    const int N = 10000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
@@ -77,7 +206,7 @@ int main() {
         int iy = i / cols;
 
         Particle p;
-        p.radius = 5.f;
+        p.radius = 1.f;
         p.position = {(ix + 0.5f) * dx + jitter(rng), (iy + 0.5f) * dy + jitter(rng)};
         p.velocity = {vel(rng), vel(rng)};
         p.acceleration = {0.f, 0.f};
@@ -86,7 +215,7 @@ int main() {
     }
 
     // Initial acceleration for velocity Verlet.
-    computeGravity(particles);
+    computeGravityBH(particles);
 
     sf::CircleShape shape;
     shape.setFillColor(sf::Color::White);
@@ -108,7 +237,7 @@ int main() {
         // 1. integrate positions + half velocity
         integrate(particles, dt);
         // 2. recompute forces
-        computeGravity(particles);
+        computeGravityBH(particles);
         // 3. finish velocity update
         for (auto& p : particles)
             p.velocity += 0.5f * p.acceleration * dt;
