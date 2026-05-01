@@ -1,4 +1,4 @@
-//When eomploying OpenGL run using: g++ -std=c++17 main.cpp -o main -lGLEW -lGL -lGLU -lsfml-graphics -lsfml-window -lsfml-system
+//When eomploying OpenGL run using: g++ main.cpp -o sim -lGLEW -lGL -lsfml-graphics -lsfml-window -lsfml-system
 #include <GL/glew.h>
 #include <SFML/Graphics.hpp>
 #include <vector>
@@ -32,6 +32,11 @@ struct GPUPosition {
 
 struct GPUVelocity {
     float vx, vy, vz, radius;
+};
+
+//Adding GPU acceleartion structs to prepare the Barnes-Hut algorithm for GPU computation
+struct GPUAcceleration {
+    float ax, ay, az, unused;
 };
 
 //For implementation of a Barnes-Hut algorithm
@@ -169,6 +174,7 @@ void computeForce(Node* node, Particle& p, float theta) {
     if (node->isLeaf()) {
         if (node->particle == nullptr || node->particle == &p) return;
 
+        // optional repulsion (keep small)
         const float rCut = 10.0f;
         if (dist < rCut) {
             float rep = 0.05f * (rCut - dist);
@@ -190,13 +196,6 @@ void computeForce(Node* node, Particle& p, float theta) {
         for (int i = 0; i < 4; ++i)
             if (node->children[i])
                 computeForce(node->children[i], p, theta);
-    }
-
-    // optional repulsion (keep small)
-    const float rCut = 10.0f;
-    if (dist < rCut) {
-        float rep = 0.05f * (rCut - dist);
-        p.acceleration -= (r / dist) * rep;
     }
 }
 
@@ -330,6 +329,27 @@ GLuint createProgram(const char* vertexSrc, const char* fragmentSrc) {
     return program;
 }
 
+//Adding a compute program helper
+GLuint createComputeProgram(const char* computeSrc) {
+    GLuint cs = compileShader(GL_COMPUTE_SHADER, computeSrc);
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, cs);
+    glLinkProgram(program);
+
+    GLint success = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+
+    if (!success) {
+        char log[1024];
+        glGetProgramInfoLog(program, 1024, nullptr, log);
+        std::cerr << "Compute program link error:\n" << log << std::endl;
+    }
+
+    glDeleteShader(cs);
+    return program;
+}
+
 int main() {
     sf::ContextSettings settings;
     settings.majorVersion = 4;
@@ -352,39 +372,67 @@ int main() {
         return -1;
     }
 
-    //Adding the OpenGL shaders after GLEW initialization
     const char* vertexShaderSrc = R"(
     #version 430 core
-
     layout(std430, binding = 0) buffer Positions {
         vec4 posMass[];
     };
-
     uniform float uWidth;
     uniform float uHeight;
     uniform float uPointSize;
-
     void main() {
         vec2 pos = posMass[gl_VertexID].xy;
-
         float x = (pos.x / uWidth) * 2.0 - 1.0;
         float y = 1.0 - (pos.y / uHeight) * 2.0;
-
         gl_Position = vec4(x, y, 0.0, 1.0);
         gl_PointSize = uPointSize;
     }
     )";
-
     const char* fragmentShaderSrc = R"(
     #version 430 core
-
     out vec4 FragColor;
-
     void main() {
         FragColor = vec4(1.0, 1.0, 1.0, 1.0);
     }
     )";
+
     GLuint renderProgram = createProgram(vertexShaderSrc, fragmentShaderSrc);
+
+    //Adding the OpenGL shaders after GLEW initialization
+    const char* integrateShaderSrc = R"(
+    #version 430 core
+    layout(local_size_x = 256) in;
+    layout(std430, binding = 0) buffer Positions {
+        vec4 posMass[];
+    };
+    layout(std430, binding = 1) buffer Velocities {
+        vec4 velRadius[];
+    };
+    layout(std430, binding = 2) buffer Accelerations {
+        vec4 acc[];
+    };
+    uniform float dt;
+    uniform float width;
+    uniform float height;
+    uniform uint numParticles;
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= numParticles) return;
+        vec2 pos = posMass[i].xy;
+        vec2 vel = velRadius[i].xy;
+        vec2 a   = acc[i].xy;
+        vel += a * dt;
+        pos += vel * dt;
+        // periodic boundary
+        if (pos.x < 0.0) pos.x += width;
+        if (pos.x >= width) pos.x -= width;
+        if (pos.y < 0.0) pos.y += height;
+        if (pos.y >= height) pos.y -= height;
+        posMass[i].xy = pos;
+        velRadius[i].xy = vel;
+    }
+    )";
+    GLuint integrateProgram = createComputeProgram(integrateShaderSrc);
 
     //After creating renderProgram
     GLuint vao;
@@ -474,6 +522,14 @@ int main() {
     std::vector<GPUVelocity> gpuVelocities(particles.size());
     GLuint posSSBO;
     GLuint velSSBO;
+    for (size_t i = 0; i < particles.size(); ++i) {
+        gpuPositions[i] = {
+            particles[i].position.x,
+            particles[i].position.y,
+            0.0f,
+            particles[i].mass
+        };
+    }
 
     glGenBuffers(1, &posSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, posSSBO);
@@ -498,12 +554,6 @@ int main() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     for (size_t i = 0; i < particles.size(); ++i) {
-        gpuPositions[i] = {
-            particles[i].position.x,
-            particles[i].position.y,
-            0.0f,
-            particles[i].mass
-        };
         gpuVelocities[i] = {
             particles[i].velocity.x,
             particles[i].velocity.y,
@@ -511,8 +561,30 @@ int main() {
             particles[i].radius
         };
     }
-    for (auto& p : particles)
-    p.velocity -= vcm;
+
+    //After creating gpuPositions and gpuVelocities
+    std::vector<GPUAcceleration> gpuAccelerations(particles.size());
+    for (size_t i = 0; i < particles.size(); ++i) {
+        gpuAccelerations[i] = {
+            particles[i].acceleration.x,
+            particles[i].acceleration.y,
+            0.0f,
+            0.0f
+        };
+    }
+
+    //Create SSBO
+    GLuint accSSBO;
+    glGenBuffers(1, &accSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, accSSBO);
+    glBufferData(
+        GL_SHADER_STORAGE_BUFFER,
+        gpuAccelerations.size() * sizeof(GPUAcceleration),
+        gpuAccelerations.data(),
+        GL_DYNAMIC_DRAW
+    );
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     // Initial acceleration for velocity Verlet.
     computeGravityBH(particles);
@@ -540,16 +612,77 @@ int main() {
 			}
         }
 
-        // 1. integrate positions + half velocity
-        integrate(particles, dt);
+        // upload current CPU accelerations to GPU
+        for (size_t i = 0; i < particles.size(); ++i) {
+            gpuAccelerations[i].ax = particles[i].acceleration.x;
+            gpuAccelerations[i].ay = particles[i].acceleration.y;
+            gpuAccelerations[i].az = 0.0f;
+            gpuAccelerations[i].unused = 0.0f;
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, accSSBO);
+        glBufferSubData(
+            GL_SHADER_STORAGE_BUFFER,
+            0,
+            gpuAccelerations.size() * sizeof(GPUAcceleration),
+            gpuAccelerations.data()
+        );
+        // GPU integration
+        glUseProgram(integrateProgram);
+        glUniform1f(glGetUniformLocation(integrateProgram, "dt"), dt);
+        glUniform1f(glGetUniformLocation(integrateProgram, "width"), static_cast<float>(width));
+        glUniform1f(glGetUniformLocation(integrateProgram, "height"), static_cast<float>(height));
+        glUniform1ui(glGetUniformLocation(integrateProgram, "numParticles"), static_cast<unsigned int>(particles.size()));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
+        GLuint groups = static_cast<GLuint>((particles.size() + 255) / 256);
+        glDispatchCompute(groups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+
+        //After the compute shader dispatch
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, posSSBO);
+        glGetBufferSubData(
+            GL_SHADER_STORAGE_BUFFER,
+            0,
+            gpuPositions.size() * sizeof(GPUPosition),
+            gpuPositions.data()
+        );
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
+        glGetBufferSubData(
+            GL_SHADER_STORAGE_BUFFER,
+            0,
+            gpuVelocities.size() * sizeof(GPUVelocity),
+            gpuVelocities.data()
+        );
+        for (size_t i = 0; i < particles.size(); ++i) {
+            particles[i].position = {gpuPositions[i].x, gpuPositions[i].y};
+            particles[i].velocity = {gpuVelocities[i].vx, gpuVelocities[i].vy};
+        }
+
         // 2. recompute forces
         computeGravityBH(particles);
         // 3. finish velocity update
         for (auto& p : particles) {
-            p.velocity += 0.5f * p.acceleration * dt;
+            //p.velocity += 0.5f * p.acceleration * dt;
             //optional cooling/dissipative term so that stable clusters are formed
             p.velocity *= 0.9999f;
         }
+
+        //After cooling, also update gpuVelocities and upload:
+        for (size_t i = 0; i < particles.size(); ++i) {
+            gpuVelocities[i].vx = particles[i].velocity.x;
+            gpuVelocities[i].vy = particles[i].velocity.y;
+            gpuVelocities[i].vz = 0.0f;
+            gpuVelocities[i].radius = particles[i].radius;
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
+        glBufferSubData(
+            GL_SHADER_STORAGE_BUFFER,
+            0,
+            gpuVelocities.size() * sizeof(GPUVelocity),
+            gpuVelocities.data()
+        );
+
 
         for (size_t i = 0; i < particles.size(); ++i) {
             gpuPositions[i].x = particles[i].position.x;
