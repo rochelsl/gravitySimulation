@@ -1,4 +1,4 @@
-//When eomploying OpenGL run using: g++ main.cpp -o sim -lGLEW -lGL -lsfml-graphics -lsfml-window -lsfml-system
+//When eomploying OpenGL run using: g++ -std=c++17 main.cpp -o main -lGLEW -lGL -lGLU -lsfml-graphics -lsfml-window -lsfml-system
 #include <GL/glew.h>
 #include <SFML/Graphics.hpp>
 #include <vector>
@@ -11,14 +11,16 @@ const int width = 1500;
 const int height = 1500;
 
 const float gConst = 1000.0;
-const float particleMass = 1000.0;
+const float particleMass = 10.0;
 
 //For Barnes-Hut algorithm, to stop subdivision at some spatial resolutions to prevent exploding tree depth
 const float MIN_SIZE = 1.0f;
 
 //Adding grid buffers for GPU computation
-const int gridW = 128;
-const int gridH = 72;
+//Higher grid resolution e.g. 256, 144 gices sharper gravity but costs more
+//Lower gives smoother, faster behavior
+const int gridW = 32;
+const int gridH = 18;
 const int gridSize = gridW * gridH;
 
 struct Particle {
@@ -42,6 +44,10 @@ struct GPUVelocity {
 //Adding GPU acceleartion structs to prepare the Barnes-Hut algorithm for GPU computation
 struct GPUAcceleration {
     float ax, ay, az, unused;
+};
+
+struct GPUForce {
+    float ax, ay, unused1, unused2;
 };
 
 //For implementation of a Barnes-Hut algorithm
@@ -419,15 +425,18 @@ int main() {
     uniform float dt;
     uniform float width;
     uniform float height;
+    uniform float damping;
     uniform uint numParticles;
     void main() {
         uint i = gl_GlobalInvocationID.x;
         if (i >= numParticles) return;
-        vec2 pos = posMass[i].xy;
-        vec2 vel = velRadius[i].xy;
-        vec2 a   = acc[i].xy;
-        vel += a * dt;
-        pos += vel * dt;
+            vec2 pos = posMass[i].xy;
+            vec2 vel = velRadius[i].xy;
+            vec2 a   = acc[i].xy;
+
+            vel += a * dt;
+            vel *= damping;
+            pos += vel * dt;
         // periodic boundary
         if (pos.x < 0.0) pos.x += width;
         if (pos.x >= width) pos.x -= width;
@@ -525,14 +534,97 @@ int main() {
     )";
     GLuint depositProgram = createComputeProgram(depositShaderSrc);
 
+    const char* computeGridForceShaderSrc = R"(
+    #version 430 core
+    layout(local_size_x = 256) in;
+    layout(std430, binding = 3) buffer DensityGrid {
+        uint density[];
+    };
+    layout(std430, binding = 4) buffer ForceGrid {
+        vec4 force[];
+    };
+    uniform uint gridW;
+    uniform uint gridH;
+    uniform float width;
+    uniform float height;
+    uniform float gConst;
+    uniform float particleMass;
+    uniform float eps;
+    void main() {
+        uint idx = gl_GlobalInvocationID.x;
+        uint gridSize = gridW * gridH;
+        if (idx >= gridSize) return;
+        uint x = idx % gridW;
+        uint y = idx / gridW;
+        vec2 cellSize = vec2(width / float(gridW), height / float(gridH));
+        vec2 posA = vec2(
+            (float(x) + 0.5) * cellSize.x,
+            (float(y) + 0.5) * cellSize.y
+        );
+        vec2 acc = vec2(0.0);
+        for (uint j = 0; j < gridSize; ++j) {
+            uint count = density[j];
+            if (count == 0u || j == idx) continue;
+            uint xj = j % gridW;
+            uint yj = j / gridW;
+            vec2 posB = vec2(
+                (float(xj) + 0.5) * cellSize.x,
+                (float(yj) + 0.5) * cellSize.y
+            );
+            vec2 r = posB - posA;
+            // periodic minimum-image convention
+            if (r.x >  width * 0.5) r.x -= width;
+            if (r.x < -width * 0.5) r.x += width;
+            if (r.y >  height * 0.5) r.y -= height;
+            if (r.y < -height * 0.5) r.y += height;
+            float mass = float(count) * particleMass;
+            float dist2 = dot(r, r) + eps * eps;
+            float invDist = inversesqrt(dist2);
+            float invDist3 = invDist * invDist * invDist;
+            acc += gConst * mass * r * invDist3;
+        }
+        force[idx] = vec4(acc, 0.0, 0.0);
+    }
+    )";
+    GLuint computeGridForceProgram = createComputeProgram(computeGridForceShaderSrc);
+
+    const char* sampleForceShaderSrc = R"(
+    #version 430 core
+    layout(local_size_x = 256) in;
+    layout(std430, binding = 0) buffer Positions {
+        vec4 posMass[];
+    };
+    layout(std430, binding = 2) buffer Accelerations {
+        vec4 acc[];
+    };
+    layout(std430, binding = 4) buffer ForceGrid {
+        vec4 force[];
+    };
+    uniform float width;
+    uniform float height;
+    uniform uint gridW;
+    uniform uint gridH;
+    uniform uint numParticles;
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= numParticles) return;
+        vec2 pos = posMass[i].xy;
+        uint cellX = uint(clamp(pos.x / width  * float(gridW), 0.0, float(gridW - 1)));
+        uint cellY = uint(clamp(pos.y / height * float(gridH), 0.0, float(gridH - 1)));
+        uint cellIndex = cellY * gridW + cellX;
+        acc[i] = force[cellIndex];
+    }
+    )";
+    GLuint sampleForceProgram = createComputeProgram(sampleForceShaderSrc);
+
     std::vector<Particle> particles;
 
-    const int N = 10000;
+    const int N = 30000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
 
-    std::uniform_real_distribution<float> vel(-60.f, 60.f);
+    std::uniform_real_distribution<float> vel(-100.f, 100.f);
     // Grid initialization avoids catastrophic LJ overlaps from random placement.
     int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
     int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
@@ -576,7 +668,7 @@ int main() {
     width * 0.5f,
     height * 0.5f
     };
-    const float rotationStrength = 1000.0f; // tune this
+    const float rotationStrength = 100.0f; // tune this
     for (auto& p : particles) {
         sf::Vector2f r = p.position - center;
         // periodic minimum-image displacement from center
@@ -685,13 +777,27 @@ int main() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, densitySSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
+    //After densitySSBO creation
+    std::vector<GPUForce> forceGrid(gridSize);
+    GLuint forceGridSSBO;
+    glGenBuffers(1, &forceGridSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, forceGridSSBO);
+    glBufferData(
+        GL_SHADER_STORAGE_BUFFER,
+        forceGrid.size() * sizeof(GPUForce),
+        forceGrid.data(),
+        GL_DYNAMIC_DRAW
+    );
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, forceGridSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
     const float dt = 0.0005f;
 
-    while (window.isOpen()) { 
-        for (auto event = sf::Event{}; window.pollEvent(event);) { 
-            if (event.type == sf::Event::Closed) { 
-                window.close(); 
-            }
+    while (window.isOpen()) {
+        sf::Event event;
+        while (window.pollEvent(event)) {
+            if (event.type == sf::Event::Closed)
+                window.close();
 			else if (event.type == sf::Event::KeyPressed) {
 				if (event.key.code == sf::Keyboard::Escape) {
 					window.close();
@@ -724,30 +830,44 @@ int main() {
         glDispatchCompute(particleGroups, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-        //At the start of each frame, before integration:
-        //glUseProgram(gravityProgram);
-        glUniform1f(glGetUniformLocation(gravityProgram, "width"), static_cast<float>(width));
-        glUniform1f(glGetUniformLocation(gravityProgram, "height"), static_cast<float>(height));
-        glUniform1f(glGetUniformLocation(gravityProgram, "gConst"), gConst);
-        glUniform1f(glGetUniformLocation(gravityProgram, "eps"), 8.0f);
-        glUniform1ui(glGetUniformLocation(gravityProgram, "numParticles"), static_cast<unsigned int>(particles.size()));
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
-
-        GLuint groups = static_cast<GLuint>((particles.size() + 255) / 256);
-        glDispatchCompute(groups, 1, 1);
+        // 3. Compute grid force field
+        glUseProgram(computeGridForceProgram);
+        glUniform1ui(glGetUniformLocation(computeGridForceProgram, "gridW"), static_cast<unsigned int>(gridW));
+        glUniform1ui(glGetUniformLocation(computeGridForceProgram, "gridH"), static_cast<unsigned int>(gridH));
+        glUniform1f(glGetUniformLocation(computeGridForceProgram, "width"), static_cast<float>(width));
+        glUniform1f(glGetUniformLocation(computeGridForceProgram, "height"), static_cast<float>(height));
+        glUniform1f(glGetUniformLocation(computeGridForceProgram, "gConst"), gConst);
+        glUniform1f(glGetUniformLocation(computeGridForceProgram, "particleMass"), particleMass);
+        glUniform1f(glGetUniformLocation(computeGridForceProgram, "eps"), 20.0f);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, densitySSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, forceGridSSBO);
+        glDispatchCompute(gridGroups, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-        // 2. GPU integration
+        // 4. Sample grid force onto particles
+        glUseProgram(sampleForceProgram);
+        glUniform1f(glGetUniformLocation(sampleForceProgram, "width"), static_cast<float>(width));
+        glUniform1f(glGetUniformLocation(sampleForceProgram, "height"), static_cast<float>(height));
+        glUniform1ui(glGetUniformLocation(sampleForceProgram, "gridW"), static_cast<unsigned int>(gridW));
+        glUniform1ui(glGetUniformLocation(sampleForceProgram, "gridH"), static_cast<unsigned int>(gridH));
+        glUniform1ui(glGetUniformLocation(sampleForceProgram, "numParticles"), static_cast<unsigned int>(particles.size()));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, forceGridSSBO);
+        glDispatchCompute(particleGroups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        // 5. GPU integration
         glUseProgram(integrateProgram);
         glUniform1f(glGetUniformLocation(integrateProgram, "dt"), dt);
         glUniform1f(glGetUniformLocation(integrateProgram, "width"), static_cast<float>(width));
         glUniform1f(glGetUniformLocation(integrateProgram, "height"), static_cast<float>(height));
+        glUniform1f(glGetUniformLocation(integrateProgram, "damping"), 0.99999f);
         glUniform1ui(glGetUniformLocation(integrateProgram, "numParticles"), static_cast<unsigned int>(particles.size()));
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, accSSBO);
-        glDispatchCompute(groups, 1, 1);
+        glDispatchCompute(particleGroups, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
 
         glViewport(0, 0, width, height);
@@ -761,21 +881,21 @@ int main() {
         glBindVertexArray(vao);
         glDrawArrays(GL_POINTS, 0, particles.size());
 
-        static int frame = 0;
-        frame++;
-        if (frame % 300 == 0) {
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, densitySSBO);
-            glGetBufferSubData(
-                GL_SHADER_STORAGE_BUFFER,
-                0,
-                densityGrid.size() * sizeof(unsigned int),
-                densityGrid.data()
-            );
-            unsigned int total = 0;
-            for (auto v : densityGrid)
-                total += v;
-            std::cout << "Deposited particles: " << total << std::endl;
-        }
+        // static int frame = 0;
+        // frame++;
+        // if (frame % 300 == 0) {
+        //     glBindBuffer(GL_SHADER_STORAGE_BUFFER, densitySSBO);
+        //     glGetBufferSubData(
+        //         GL_SHADER_STORAGE_BUFFER,
+        //         0,
+        //         densityGrid.size() * sizeof(unsigned int),
+        //         densityGrid.data()
+        //     );
+        //     unsigned int total = 0;
+        //     for (auto v : densityGrid)
+        //         total += v;
+        //     std::cout << "Deposited particles: " << total << std::endl;
+        // }
 
         window.display();
     }
