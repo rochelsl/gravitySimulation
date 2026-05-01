@@ -7,8 +7,8 @@
 const int width = 1920;
 const int height = 1080;
 
-const float gConst = 100.0;
-const float particleMass = 1.0;
+const float gConst = 1000.0;
+const float particleMass = 100.0;
 
 //For Barnes-Hut algorithm, to stop subdivision at some spatial resolutions to prevent exploding tree depth
 const float MIN_SIZE = 1.0f;
@@ -146,34 +146,39 @@ void computeForce(Node* node, Particle& p, float theta) {
 
     sf::Vector2f r = node->com - p.position;
 
-    //Periodic boundary
-    // wrap to nearest image
+    // periodic wrapping
     if (r.x >  width * 0.5f) r.x -= width;
     if (r.x < -width * 0.5f) r.x += width;
-
     if (r.y >  height * 0.5f) r.y -= height;
     if (r.y < -height * 0.5f) r.y += height;
 
-    float dist2 = r.x * r.x + r.y * r.y + 1e-6f;
+    const float eps = 5.0f;
+    float dist2 = r.x * r.x + r.y * r.y + eps * eps;
     float dist = std::sqrt(dist2);
 
-    // region size
     float s = node->boundary.halfSize * 2.f;
 
-    // if far enough → approximate
+    // ✅ ONLY here decide: approximate OR recurse
     if (node->isLeaf() || (s / dist) < theta) {
-        if (node->particle == &p) return; // skip self
+        if (node->particle == &p) return;
 
-        float f = gConst * (p.mass * node->mass) / dist2;
-        sf::Vector2f force = (r / dist) * f;
+        float invDist = 1.0f / dist;
+        float invDist3 = invDist * invDist * invDist;
 
-        p.acceleration += force / p.mass;
+        float f = gConst * node->mass * invDist3;
+        p.acceleration += r * f;
     } else {
-        // recurse
         for (int i = 0; i < 4; ++i) {
             if (node->children[i])
                 computeForce(node->children[i], p, theta);
         }
+    }
+
+    // optional repulsion (keep small)
+    const float rCut = 10.0f;
+    if (dist < rCut) {
+        float rep = 0.05f * (rCut - dist);
+        p.acceleration -= (r / dist) * rep;
     }
 }
 
@@ -240,12 +245,12 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 10000;
+    const int N = 1000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
     std::uniform_real_distribution<float> jitter(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> vel(-0.f, 0.f);
+    std::uniform_real_distribution<float> vel(-10.f, 10.f);
     // Grid initialization avoids catastrophic LJ overlaps from random placement.
     int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
     int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
