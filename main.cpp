@@ -287,17 +287,20 @@ int main() {
 
     std::vector<Particle> particles;
 
-    const int N = 10000;
+    const int N = 1000;
     particles.reserve(N);
 
     std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> jitter(-0.4f, 0.4f);
-    std::uniform_real_distribution<float> vel(-10.f, 10.f);
+
+    std::uniform_real_distribution<float> vel(-40.f, 40.f);
     // Grid initialization avoids catastrophic LJ overlaps from random placement.
     int cols = static_cast<int>(std::ceil(std::sqrt(N * static_cast<float>(width) / height)));
     int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols));
     float dx = static_cast<float>(width) / cols;
     float dy = static_cast<float>(height) / rows;
+    //deviations from perfect square lattice
+    std::uniform_real_distribution<float> jitterX(-0.4f * dx, 0.4f * dx);
+    std::uniform_real_distribution<float> jitterY(-0.4f * dy, 0.4f * dy);
 
     for (int i = 0; i < N; ++i) {
         int ix = i % cols;
@@ -305,7 +308,10 @@ int main() {
 
         Particle p;
         p.radius = 1.f;
-        p.position = {(ix + 0.5f) * dx + jitter(rng), (iy + 0.5f) * dy + jitter(rng)};
+        p.position = {
+            (ix + 0.5f) * dx + jitterX(rng),
+            (iy + 0.5f) * dy + jitterY(rng)
+        };
         p.velocity = {vel(rng), vel(rng)};
         p.acceleration = {0.f, 0.f};
         p.mass = particleMass;
@@ -317,12 +323,36 @@ int main() {
     float U = computePotential(particles);
 
     // target: 2T = |U|
-    //if the system is too "hot", reduce the scaling factor
-    float scale = 0.05f * std::sqrt(std::abs(U) / (2.0f * T));
+    //if the system is too "hot"/gas-like, reduce the scaling factor
+    float scale = 0.01f * std::sqrt(std::abs(U) / (2.0f * T));
 
     // rescale velocities
     for (auto& p : particles) {
         p.velocity *= scale;
+    }
+
+    //Add a rotational velocity around the box center
+    sf::Vector2f center = {
+    width * 0.5f,
+    height * 0.5f
+    };
+    const float rotationStrength = 200.0f; // tune this
+    for (auto& p : particles) {
+        sf::Vector2f r = p.position - center;
+        // periodic minimum-image displacement from center
+        if (r.x >  width * 0.5f) r.x -= width;
+        if (r.x < -width * 0.5f) r.x += width;
+        if (r.y >  height * 0.5f) r.y -= height;
+        if (r.y < -height * 0.5f) r.y += height;
+        float dist = std::sqrt(r.x * r.x + r.y * r.y) + 1e-6f;
+        // tangential direction
+        sf::Vector2f tangent = {
+            -r.y / dist,
+            r.x / dist
+        };
+        // optional: weaker rotation near center, stronger farther out
+        float speed = rotationStrength * std::sqrt(dist / std::max(width, height));
+        p.velocity += tangent * speed;
     }
 
     //Remove net momentum/drift which might occur from random initial velocity initialization
